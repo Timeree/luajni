@@ -2,3 +2,5 @@ build/
 *.o
 *.so
 *.class
+hs_err_pid*.log
+core.*

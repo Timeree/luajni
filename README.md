@@ -16,7 +16,7 @@ luajni/
 ## 环境
 
 - Linux，C 编译器，GNU make，curl
-- JDK 8+（需要 `jni.h`，默认由 `javac` 位置推导）
+- JDK 8+（模块本身；测试脚本用 `--release 17`，需要 JDK 17+）
 - Lua 5.4；`make` 会从 lua.org 下载并编译 `LUA_VERSION`（默认 5.4.9）
 
 ## 构建与测试
@@ -24,6 +24,7 @@ luajni/
 ```sh
 make                  # 生成 build/luajni/jni.so 与 build/luajni.lua
 make test             # 编译 Java 夹具并运行完整测试
+make test CHECK_JNI=1 # 同时开启 -Xcheck:jni
 make install          # PREFIX=/usr/local
 ```
 
@@ -32,7 +33,7 @@ make install          # PREFIX=/usr/local
 ```sh
 make LUA_VERSION=5.4.9          # 指定 Lua 源码版本
 make JDK=/path/to/jdk           # 指定 JDK
-make LUA_INC=/usr/include/lua5.4 LUA=lua5.4 test   # 使用系统 Lua
+make LUA_INC=/usr/include/lua5.4 LUA=lua5.4 test   # 使用系统 Lua（两个变量一起给）
 ```
 
 ## 快速开始
@@ -55,7 +56,7 @@ print(f:call("getAbsolutePath", "()Ljava/lang/String;"))
 
 ### jni.vm(opts) -> VM
 
-创建或附着当前进程已有的 JVM。参数均可省略：
+创建或附着当前进程已有的 JVM。已存在 JVM 时直接附着，创建参数被忽略。参数均可省略：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -69,7 +70,7 @@ print(f:call("getAbsolutePath", "()Ljava/lang/String;"))
 
 | 方法 | 说明 |
 | --- | --- |
-| `vm:env()` | 当前线程的 `JNIEnv`，未附着时自动附着并缓存 |
+| `vm:env()` | 当前线程的 `JNIEnv`，未附着时自动附着并缓存（detach 后再次调用会重新附着） |
 | `vm:attach()` / `vm:detach()` | 显式附着 / 解除当前线程 |
 | `vm:class(name)` | 查找类，返回 `Class`（全局引用） |
 | `vm:array(desc, values)` | 由 Lua 表或长度创建数组，返回 `Array` |
@@ -80,13 +81,16 @@ print(f:call("getAbsolutePath", "()Ljava/lang/String;"))
 ### Class
 
 ```lua
-local C = vm:class("java/util/ArrayList")
+local Demo = vm:class("demo/Demo")
 
-local o = C:new("(I)V", 16)                    -- 构造
-local add = C:static("valueOf", "(I)Ljava/lang/Integer;")  -- 静态方法绑定
-local n = C:callStatic("parseInt", "(Ljava/lang/String;)I", "42")
-local f = C:getStatic("MAX_VALUE", "I")
-C:setStatic("SOME_FIELD", "I", 1)
+local add = Demo:static("add", "(II)I")         -- 绑定静态方法
+print(add(1, 2))                                -- 3
+print(Demo:callStatic("twice", "(J)J", 21))     -- 42
+print(Demo:getStatic("CONST", "I"))             -- 42
+Demo:setStatic("BIG", "J", 5)
+
+local list = vm:class("java/util/ArrayList"):new("(I)V", 16)
+print(list:call("size", "()I"))                 -- 0
 ```
 
 | 方法 | 说明 |
@@ -100,11 +104,15 @@ C:setStatic("SOME_FIELD", "I", 1)
 ### Object
 
 ```lua
-local o = C:new("()V")
-local size = o:method("size", "()I")
-print(size())
-print(o:call("toString", "()Ljava/lang/String;"))
-print(o:get("value", "I"))
+local list = vm:class("java/util/ArrayList"):new()
+print(list:call("size", "()I"))                          -- 0
+list:call("add", "(Ljava/lang/Object;)Z", "x")
+print(list:call("size", "()I"))                          -- 1
+print(list:call("toString", "()Ljava/lang/String;"))      -- [x]
+
+local Demo = vm:class("demo/Demo")
+local o = Demo:new("(I)V", 10)
+print(o:get("value", "I"))                               -- 10
 o:set("value", "I", 9)
 ```
 
@@ -142,7 +150,7 @@ a:set(2, 20)
 | `F` `D` | number | number |
 | `C` | integer 或单字节字符串 | integer（UTF-16 码元） |
 | `Ljava/lang/String;` | Lua 字符串 | Lua 字符串 |
-| 其它 `L...;` | Object/Class 包装、原始引用 | Object 包装 |
+| 其它 `L...;` | Object/Class 包装、`jni.object(ptr)` | Object 包装 |
 | `[...` | Lua 表、Array 包装、原始引用 | Array 包装 |
 | `V` | — | nil |
 
@@ -160,8 +168,11 @@ local vm = jni.vm({ classpath = "build/test-classes" })
 local env = vm:env()
 
 local cls = env:FindClass("java/lang/Integer")
-local mid = env:GetStaticMethodID(cls, "parseInt", "(Ljava/lang/String;)I")
-print(env:CallStaticIntMethod(cls, mid, { jni.int(42) }))
+local parse = env:GetStaticMethodID(cls, "parseInt", "(Ljava/lang/String;)I")
+print(env:CallStaticIntMethod(cls, parse, { "42" }))
+
+local cmp = env:GetStaticMethodID(cls, "compare", "(II)I")
+print(env:CallStaticIntMethod(cls, cmp, { jni.int(7), jni.int(3) }))
 
 env:DeleteLocalRef(cls)
 ```
@@ -174,8 +185,9 @@ env:DeleteLocalRef(cls)
 - 对象与方法：`AllocObject`、`GetObjectClass`、`IsInstanceOf`、`GetMethodID`、`GetFieldID`、`GetStaticMethodID`、`GetStaticFieldID`
 - 调用：`Call<Type>Method`、`CallStatic<Type>Method`、`CallNonvirtual<Type>Method`（`Type` = Boolean/Byte/Char/Short/Int/Long/Float/Double/Object/Void），每个都有 `A`、`V` 别名
 - 字段：`Get/Set<Type>Field`、`Get/SetStatic<Type>Field`
-- 字符串：`NewString`、`GetStringLength`、`GetStringChars`、`ReleaseStringChars`、`NewStringUTF`、`GetStringUTFLength`、`GetStringUTFChars`、`ReleaseStringUTFChars`、`GetStringRegion`、`GetStringUTFRegion`
-- 数组：`New<Type>Array`、`Get/Release<Type>ArrayElements`、`Get/Set<Type>ArrayRegion`、`NewObjectArray`、`Get/SetObjectArrayElement`、`GetArrayLength`
+- 字符串：`NewString`、`GetStringLength`、`GetStringChars`、`ReleaseStringChars`、`NewStringUTF`、`GetStringUTFLength`、`GetStringUTFChars`、`ReleaseStringUTFChars`、`GetStringRegion`、`GetStringUTFRegion`、`GetStringCritical`、`ReleaseStringCritical`、`GetStringUTFLengthAsLong`（JNI 24+）
+- 标准 UTF-8 辅助：`NewStringUTF8` / `GetStringUTF8`，支持 4 字节字符与内嵌 NUL；`NewStringUTF` / `GetStringUTFChars` 仍保持 JNI modified UTF-8 语义
+- 数组：`New<Type>Array`、`Get/Release<Type>ArrayElements`、`Get/Set<Type>ArrayRegion`、`Get/ReleasePrimitiveArrayCritical`、`NewObjectArray`、`Get/SetObjectArrayElement`、`GetArrayLength`
 - 其它：`MonitorEnter/Exit`、`RegisterNatives`、`UnregisterNatives`、`GetJavaVM`、`GetModule`（JNI 9+）、`IsVirtualThread`（JNI 21+）、`NewDirectByteBuffer`、`GetDirectBufferAddress`、`GetDirectBufferCapacity`、`GetObjectRefType`
 
 `A` 与 `V` 别名与普通形式相同：参数位置接受 Lua 表（内部构造 `jvalue[]`），因为 `va_list` 无法跨 Lua 边界。
@@ -207,14 +219,18 @@ print(jni.read(buf, "utf8", 5))
 类型：`int8` `uint8` `int16` `uint16` `int32` `uint32` `int64` `uint64` `float` `double` `pointer` `utf8`。
 `Get<Type>ArrayRegion` / `Set<Type>ArrayRegion` / `GetStringRegion` / `GetStringUTFRegion` 在省略缓冲区参数时直接收发 Lua 表或字符串。
 
-### JavaVM
+### JavaVM 与 Invocation API
 
 底层 VM 对象提供 `env`、`attach`、`detach`、`GetEnv`、`AttachCurrentThread`、`AttachCurrentThreadAsDaemon`、`DetachCurrentThread`、`DestroyJavaVM`、`close`、`ptr`。
+模块级提供 `JNI_GetCreatedJavaVMs` 与 `JNI_GetDefaultJavaVMInitArgs`；创建 JVM 由 `jni.vm` 完成。
 
 ## 注意
 
 - 每个进程只能创建一个 JVM；`vm:close()` 销毁后无法在同一进程重建。
-- 默认单线程使用。其它线程先 `vm:attach()`，结束前 `vm:detach()`。
+- 默认单线程使用。其它线程先 `vm:attach()`，结束前 `vm:detach()`；detach 后首次调用会自动重新附着。
+- detach 会释放当前线程的局部引用：`Object`/`Array` 包装在 detach 后失效，`Class`（全局引用）可继续使用。
+- 高层 API 的 Lua 字符串使用标准 UTF-8（含 emoji 与 `\0`），不经过 JNI modified UTF-8。
+- `jni.read` / `jni.write` 不检查缓冲区边界，由调用方保证长度正确。
 - 局部引用只在当前线程与调用帧内有效；循环中处理大量对象时用 `env:PushLocalFrame` / `env:PopLocalFrame`。
 - `RegisterNatives` 的第三项是 C 函数指针，需要由宿主程序提供。
 - JNI 调用失败会留下 pending exception；底层 API 不自动清除，使用 `luajni.check(env)` 或 `env:ExceptionCheck()`。

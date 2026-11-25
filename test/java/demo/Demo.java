@@ -34,6 +34,10 @@ public class Demo {
         return a + b;
     }
 
+    public static int square(int v) {
+        return v * v;
+    }
+
     public static long twice(long v) {
         return v * 2;
     }
@@ -56,6 +60,22 @@ public class Demo {
 
     public static String greet(String name) {
         return "Hello, " + name + "!";
+    }
+
+    public static String echo(String s) {
+        return s;
+    }
+
+    public static float[] floats() {
+        return new float[] { 1.5f, 2.5f };
+    }
+
+    public static boolean[] flags() {
+        return new boolean[] { true, false };
+    }
+
+    public static char[] chars() {
+        return new char[] { 'a', 'b' };
     }
 
     public static int[] numbers(int n) {

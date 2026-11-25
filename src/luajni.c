@@ -55,7 +55,10 @@ static Env *check_env(lua_State *L) { return (Env *)luaL_checkudata(L, 1, ENV_MT
 static JNIEnv *env_of(lua_State *L) {
   Env *e = check_env(L);
   if (!e->vm->jvm) luaL_error(L, "luajni: JVM is closed");
-  return e->env;
+  void *cur = NULL;
+  if ((*e->vm->jvm)->GetEnv(e->vm->jvm, &cur, JNI_VERSION_1_8) != JNI_OK || !cur)
+    luaL_error(L, "luajni: current thread is not attached to the JVM");
+  return (JNIEnv *)cur;
 }
 
 #define E(L) env_of(L)
@@ -78,11 +81,18 @@ static VM *check_vm(lua_State *L) { return (VM *)luaL_checkudata(L, 1, VM_MT); }
 #define A_FLOAT(i) ((jfloat)luaL_checknumber(L, (i)))
 #define A_DOUBLE(i) ((jdouble)luaL_checknumber(L, (i)))
 
-#define PUSH_REF(v) return ((v) ? (lua_pushlightuserdata(L, (void *)(v)), 1) : (lua_pushnil(L), 1))
+#define PUSH_REF(v)                     \
+  do {                                  \
+    void *p_ = (void *)(v);             \
+    if (p_)                             \
+      lua_pushlightuserdata(L, p_);     \
+    else                                \
+      lua_pushnil(L);                   \
+    return 1;                           \
+  } while (0)
 #define PUSH_INT(v) return (lua_pushinteger(L, (lua_Integer)(v)), 1)
 #define PUSH_NUM(v) return (lua_pushnumber(L, (lua_Number)(v)), 1)
 #define PUSH_BOOL(v) return (lua_pushboolean(L, (v) != JNI_FALSE), 1)
-#define PUSH_VOID(v) return 0
 
 static jchar arg_char(lua_State *L, int i) {
   if (lua_type(L, i) == LUA_TSTRING) {
@@ -96,6 +106,7 @@ static jchar arg_char(lua_State *L, int i) {
 static void args_init(Args *a) { memset(a, 0, sizeof(*a)); }
 
 static void args_free(JNIEnv *e, Args *a) {
+  (*e)->ExceptionCheck(e);
   for (int i = 0; i < a->nrefs; i++)
     if (a->refs[i]) (*e)->DeleteLocalRef(e, a->refs[i]);
   free(a->v);
@@ -420,6 +431,29 @@ static int l_ReleaseStringUTFChars(lua_State *L) {
   return 0;
 }
 
+static int l_GetPrimitiveArrayCritical(lua_State *L) {
+  jboolean copy = JNI_FALSE;
+  void *p = (*E(L))->GetPrimitiveArrayCritical(E(L), (jarray)A_PTR(2), &copy);
+  lua_pushlightuserdata(L, p);
+  lua_pushboolean(L, copy != JNI_FALSE);
+  return 2;
+}
+static int l_ReleasePrimitiveArrayCritical(lua_State *L) {
+  (*E(L))->ReleasePrimitiveArrayCritical(E(L), (jarray)A_PTR(2), A_PTR(3), A_MODE(4));
+  return 0;
+}
+static int l_GetStringCritical(lua_State *L) {
+  jboolean copy = JNI_FALSE;
+  const jchar *p = (*E(L))->GetStringCritical(E(L), (jstring)A_PTR(2), &copy);
+  lua_pushlightuserdata(L, (void *)p);
+  lua_pushboolean(L, copy != JNI_FALSE);
+  return 2;
+}
+static int l_ReleaseStringCritical(lua_State *L) {
+  (*E(L))->ReleaseStringCritical(E(L), (jstring)A_PTR(2), (const jchar *)A_PTR(3));
+  return 0;
+}
+
 static int l_GetStringRegion(lua_State *L) {
   JNIEnv *e = E(L);
   jsize start = A_SIZE(3), len = A_SIZE(4);
@@ -454,16 +488,114 @@ static int l_GetStringUTFRegion(lua_State *L) {
   return 1;
 }
 
-/* convenience: read a jstring as a Lua UTF-8 string */
-static int l_GetStringUTF(lua_State *L) {
+/* Standard UTF-8 conversion. NewStringUTF and GetStringUTFChars above keep
+ * their exact JNI (modified UTF-8) semantics; these two helpers convert
+ * between Java UTF-16 and standard UTF-8, including supplementary characters
+ * and embedded NUL bytes. */
+static void push_utf16(lua_State *L, const jchar *s, jsize n) {
+  luaL_Buffer b;
+  luaL_buffinit(L, &b);
+  for (jsize i = 0; i < n; i++) {
+    uint32_t cp = s[i];
+    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n && s[i + 1] >= 0xDC00 &&
+        s[i + 1] <= 0xDFFF) {
+      cp = 0x10000 + ((cp - 0xD800) << 10) + (s[i + 1] - 0xDC00);
+      i++;
+    }
+    if (cp < 0x80) {
+      luaL_addchar(&b, (char)cp);
+    } else if (cp < 0x800) {
+      luaL_addchar(&b, (char)(0xC0 | (cp >> 6)));
+      luaL_addchar(&b, (char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      luaL_addchar(&b, (char)(0xE0 | (cp >> 12)));
+      luaL_addchar(&b, (char)(0x80 | ((cp >> 6) & 0x3F)));
+      luaL_addchar(&b, (char)(0x80 | (cp & 0x3F)));
+    } else {
+      luaL_addchar(&b, (char)(0xF0 | (cp >> 18)));
+      luaL_addchar(&b, (char)(0x80 | ((cp >> 12) & 0x3F)));
+      luaL_addchar(&b, (char)(0x80 | ((cp >> 6) & 0x3F)));
+      luaL_addchar(&b, (char)(0x80 | (cp & 0x3F)));
+    }
+  }
+  luaL_pushresult(&b);
+}
+
+static int l_GetStringUTF8(lua_State *L) {
   JNIEnv *e = E(L);
   jstring s = (jstring)A_PTR(2);
   if (!s) return (lua_pushnil(L), 1);
-  const char *c = (*e)->GetStringUTFChars(e, s, NULL);
-  if (!c) return (lua_pushnil(L), 1);
-  lua_pushstring(L, c);
-  (*e)->ReleaseStringUTFChars(e, s, c);
+  jsize n = (*e)->GetStringLength(e, s);
+  if (n == 0) return (lua_pushliteral(L, ""), 1);
+  const jchar *p = (*e)->GetStringChars(e, s, NULL);
+  if (!p) return (lua_pushnil(L), 1);
+  jchar *buf = (jchar *)malloc(sizeof(jchar) * (size_t)n);
+  if (!buf) {
+    (*e)->ReleaseStringChars(e, s, p);
+    return luaL_error(L, "luajni: out of memory");
+  }
+  memcpy(buf, p, sizeof(jchar) * (size_t)n);
+  (*e)->ReleaseStringChars(e, s, p);
+  push_utf16(L, buf, n);
+  free(buf);
   return 1;
+}
+
+static int l_NewStringUTF8(lua_State *L) {
+  JNIEnv *e = E(L);
+  if (lua_isnil(L, 2)) return (lua_pushnil(L), 1);
+  size_t len;
+  const unsigned char *s = (const unsigned char *)luaL_checklstring(L, 2, &len);
+  jchar *buf = (jchar *)malloc(sizeof(jchar) * (len > 0 ? len : 1));
+  if (!buf) return luaL_error(L, "luajni: out of memory");
+  jsize n = 0;
+  size_t i = 0;
+  while (i < len) {
+    unsigned char c = s[i++];
+    uint32_t cp;
+    int extra;
+    if (c < 0x80) {
+      cp = c;
+      extra = 0;
+    } else if ((c & 0xE0) == 0xC0) {
+      cp = c & 0x1F;
+      extra = 1;
+    } else if ((c & 0xF0) == 0xE0) {
+      cp = c & 0x0F;
+      extra = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+      cp = c & 0x07;
+      extra = 3;
+    } else {
+      cp = 0xFFFD;
+      extra = 0;
+    }
+    int ok = i + (size_t)extra <= len;
+    for (int k = 0; ok && k < extra; k++) {
+      unsigned char cc = s[i + k];
+      if ((cc & 0xC0) != 0x80) {
+        ok = 0;
+        break;
+      }
+      cp = (cp << 6) | (cc & 0x3F);
+    }
+    if (!ok) {
+      cp = 0xFFFD;
+    } else {
+      i += (size_t)extra;
+    }
+    if (cp >= 0x10000 && cp <= 0x10FFFF) {
+      cp -= 0x10000;
+      buf[n++] = (jchar)(0xD800 + (cp >> 10));
+      buf[n++] = (jchar)(0xDC00 + (cp & 0x3FF));
+    } else {
+      if (cp > 0x10FFFF) cp = 0xFFFD;
+      buf[n++] = (jchar)cp;
+    }
+  }
+  jstring r = (*e)->NewString(e, buf, n);
+  free(buf);
+  PUSH_REF(r);
 }
 
 /* ------------------------------------------------------------------ */
@@ -620,6 +752,12 @@ static int l_GetObjectRefType(lua_State *L) {
 #ifdef JNI_VERSION_9
 static int l_GetModule(lua_State *L) {
   PUSH_REF((*E(L))->GetModule(E(L), A_CLS(2)));
+}
+#endif
+
+#ifdef JNI_VERSION_24
+static int l_GetStringUTFLengthAsLong(lua_State *L) {
+  PUSH_INT((*E(L))->GetStringUTFLengthAsLong(E(L), (jstring)A_PTR(2)));
 }
 #endif
 
@@ -956,6 +1094,10 @@ static int l_val_object(lua_State *L) {
   return 1;
 }
 
+static int l_ispointer(lua_State *L) {
+  PUSH_BOOL(lua_islightuserdata(L, 1));
+}
+
 /* ------------------------------------------------------------------ */
 /* Raw memory helpers                                                  */
 /* ------------------------------------------------------------------ */
@@ -1142,7 +1284,12 @@ static const luaL_Reg env_methods[] = {
     {"ReleaseStringUTFChars", l_ReleaseStringUTFChars},
     {"GetStringRegion", l_GetStringRegion},
     {"GetStringUTFRegion", l_GetStringUTFRegion},
-    {"GetStringUTF", l_GetStringUTF},
+    {"GetPrimitiveArrayCritical", l_GetPrimitiveArrayCritical},
+    {"ReleasePrimitiveArrayCritical", l_ReleasePrimitiveArrayCritical},
+    {"GetStringCritical", l_GetStringCritical},
+    {"ReleaseStringCritical", l_ReleaseStringCritical},
+    {"GetStringUTF8", l_GetStringUTF8},
+    {"NewStringUTF8", l_NewStringUTF8},
     {"GetArrayLength", l_GetArrayLength},
     ARRAY_LIST(REG_ARRAYS)
     {"NewObjectArray", l_NewObjectArray},
@@ -1161,6 +1308,9 @@ static const luaL_Reg env_methods[] = {
     {"GetObjectRefType", l_GetObjectRefType},
 #ifdef JNI_VERSION_9
     {"GetModule", l_GetModule},
+#endif
+#ifdef JNI_VERSION_24
+    {"GetStringUTFLengthAsLong", l_GetStringUTFLengthAsLong},
 #endif
 #ifdef JNI_VERSION_21
     {"IsVirtualThread", l_IsVirtualThread},
@@ -1196,6 +1346,7 @@ static const luaL_Reg module_methods[] = {
     {"float", l_val_float},
     {"double", l_val_double},
     {"object", l_val_object},
+    {"ispointer", l_ispointer},
     {NULL, NULL}};
 
 static void push_int_field(lua_State *L, const char *name, lua_Integer v) {

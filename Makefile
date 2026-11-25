@@ -1,11 +1,16 @@
 LUA_VERSION ?= 5.4.9
 BUILD       ?= build
-JDK         ?= $(shell dirname $$(dirname $$(readlink -f $$(command -v javac))))
 JAVAC       ?= javac
+JDK         ?= $(shell dirname $$(dirname $$(readlink -f $$(command -v $(JAVAC)))))
 
-LUA_SRC ?= $(BUILD)/lua-$(LUA_VERSION)
-LUA_INC ?= $(LUA_SRC)/src
-LUA     ?= $(LUA_SRC)/src/lua
+LUA_SRC     ?= $(BUILD)/lua-$(LUA_VERSION)
+BUNDLED_LUA := $(LUA_SRC)/src/lua
+LUA_INC     ?= $(LUA_SRC)/src
+LUA         ?= $(BUNDLED_LUA)
+
+ifeq ($(LUA),$(BUNDLED_LUA))
+LUA_DEP := $(BUNDLED_LUA)
+endif
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra
@@ -13,7 +18,8 @@ override CFLAGS += -fPIC -I$(LUA_INC) -I$(JDK)/include -I$(JDK)/include/linux
 override LDFLAGS += -shared
 LDLIBS  += -ldl
 
-CLASSES := $(BUILD)/test-classes
+CLASSES   := $(BUILD)/test-classes
+CHECK_JNI ?=
 MODULE  := $(BUILD)/luajni/jni.so
 
 all: $(MODULE) $(BUILD)/luajni.lua
@@ -22,15 +28,17 @@ $(MODULE): src/luajni.c $(LUA_INC)/lua.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-$(LUA_INC)/lua.h: $(LUA)
+ifeq ($(LUA_INC),$(LUA_SRC)/src)
+$(LUA_INC)/lua.h: $(BUNDLED_LUA)
+endif
 
 $(BUILD)/luajni.lua: lua/luajni.lua
 	@mkdir -p $(@D)
 	cp $< $@
 
-lua: $(LUA)
+lua: $(BUNDLED_LUA)
 
-$(LUA): $(BUILD)/lua-$(LUA_VERSION).tar.gz
+$(BUNDLED_LUA): $(BUILD)/lua-$(LUA_VERSION).tar.gz
 	tar -xzf $< -C $(BUILD)
 	env -u MAKEFLAGS -u MFLAGS $(MAKE) -C $(LUA_SRC) linux MYCFLAGS=-fPIC
 
@@ -43,10 +51,11 @@ $(CLASSES)/demo/Demo.class: test/java/demo/Demo.java
 	@mkdir -p $(CLASSES)
 	$(JAVAC) --release 17 -d $(CLASSES) $<
 
-test: all $(CLASSES)/demo/Demo.class $(LUA)
+test: all $(CLASSES)/demo/Demo.class $(LUA_DEP)
 	LUA_CPATH="$(abspath $(BUILD))/?.so;;" \
 	LUA_PATH="$(abspath $(BUILD))/?.lua;;" \
 	LUAJNI_CLASSPATH="$(abspath $(CLASSES))" \
+	LUAJNI_CHECK_JNI="$(CHECK_JNI)" \
 	$(LUA) test/test.lua
 
 PREFIX      ?= /usr/local

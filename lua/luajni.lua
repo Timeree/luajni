@@ -86,7 +86,7 @@ local function pending(env)
       local tcls = env:FindClass("java/lang/Throwable")
       local tos = env:GetMethodID(tcls, "toString", "()Ljava/lang/String;")
       local s = env:CallObjectMethod(thrown, tos, {})
-      if s then text = env:GetStringUTF(s) end
+      if s and not env:ExceptionCheck() then text = env:GetStringUTF8(s) end
       env:DeleteLocalRef(s)
       env:DeleteLocalRef(tcls)
     end)
@@ -107,9 +107,13 @@ local function wrap(vm, env, desc, ref)
   }, mt)
 end
 
-local function guarded(vm, ret, fn)
+local function guarded(vm, ret, fn, cap)
   local env = vm:env()
-  env:PushLocalFrame(32)
+  local rc = env:PushLocalFrame(cap or 16)
+  if rc < 0 then
+    local ex = pending(env)
+    error(ex or "luajni: cannot push a local frame", 0)
+  end
   local ok, r = pcall(fn)
   if not ok then
     local ex = pending(env)
@@ -126,7 +130,15 @@ local function guarded(vm, ret, fn)
     return nil
   end
   if ret == "Ljava/lang/String;" then
-    local s = r ~= nil and env:GetStringUTF(r) or nil
+    local s
+    if r ~= nil then
+      s = env:GetStringUTF8(r)
+      if s == nil then
+        local err2 = pending(env)
+        env:PopLocalFrame(nil)
+        error(err2 or "luajni: cannot convert the returned string", 0)
+      end
+    end
     env:PopLocalFrame(nil)
     return s
   end
@@ -161,7 +173,12 @@ newArrayRef = function(env, desc, values, n)
   local ref = env:NewObjectArray(len, cls, nil)
   env:DeleteLocalRef(cls)
   for i = 1, len do
-    env:SetObjectArrayElement(ref, i - 1, boxArg(env, elem, values and values[i] or nil))
+    local v = values and values[i] or nil
+    local o = boxArg(env, elem, v)
+    env:SetObjectArrayElement(ref, i - 1, o)
+    if type(v) == "string" or (type(v) == "table" and not v.ref) then
+      env:DeleteLocalRef(o)
+    end
   end
   return ref
 end
@@ -176,14 +193,15 @@ boxArg = function(env, desc, v)
   if c == "L" then
     if v == nil or v == J.null then return J.null end
     if type(v) == "string" then
-      if desc == "Ljava/lang/String;" then return env:NewStringUTF(v) end
+      if desc == "Ljava/lang/String;" then return env:NewStringUTF8(v) end
       err("cannot pass a Lua string as %s", desc)
     end
     if type(v) == "table" then
       if v.ref then return v.ref end
       err("cannot pass a table as %s", desc)
     end
-    return v
+    if J.ispointer(v) then return v end
+    err("cannot pass %s as %s", type(v), desc)
   end
   if c == "[" then
     if v == nil or v == J.null then return J.null end
@@ -191,7 +209,8 @@ boxArg = function(env, desc, v)
       if v.ref then return v.ref end
       return newArrayRef(env, desc, v)
     end
-    return v
+    if J.ispointer(v) then return v end
+    err("cannot pass %s as %s", type(v), desc)
   end
   err("invalid descriptor %q", desc)
 end
@@ -210,20 +229,20 @@ local function checkArity(name, sig, params, n)
   end
 end
 
-local function callMethod(vm, env, target, mid, fname, params, ret, ...)
+local function callMethod(vm, env, owner, mid, fname, params, ret, ...)
   local packed = table.pack(...)
   return guarded(vm, ret, function()
     local boxed = {}
     for i = 1, #params do boxed[i] = boxArg(env, params[i], packed[i]) end
-    return env[fname](env, target, mid, boxed)
-  end)
+    return env[fname](env, owner.ref, mid, boxed)
+  end, 16 + 2 * #params)
 end
 
 function Obj:methodID(name, sig)
   local key = name .. sig
   local id = self._methods[key]
   if id then return id end
-  local env = self.env
+  local env = self.vm:env()
   local cls = env:GetObjectClass(self.ref)
   id = env:GetMethodID(cls, name, sig)
   env:DeleteLocalRef(cls)
@@ -238,11 +257,11 @@ function Obj:method(name, sig)
   local params, ret = parse(sig)
   local mid = self:methodID(name, sig)
   local fname = callName(ret, false)
-  local env, ref, vm = self.env, self.ref, self.vm
+  local owner, env = self, self.env
   return function(...)
     local n = select("#", ...)
     checkArity(name, sig, params, n)
-    return callMethod(vm, env, ref, mid, fname, params, ret, ...)
+    return callMethod(owner.vm, env, owner, mid, fname, params, ret, ...)
   end
 end
 
@@ -251,14 +270,14 @@ function Obj:call(name, sig, ...)
   local mid = self:methodID(name, sig)
   local n = select("#", ...)
   checkArity(name, sig, params, n)
-  return callMethod(self.vm, self.env, self.ref, mid, callName(ret, false), params, ret, ...)
+  return callMethod(self.vm, self.env, self, mid, callName(ret, false), params, ret, ...)
 end
 
 function Obj:fieldID(name, desc)
   local key = name .. desc
   local id = self._fields[key]
   if id then return id end
-  local env = self.env
+  local env = self.vm:env()
   local cls = env:GetObjectClass(self.ref)
   id = env:GetFieldID(cls, name, desc)
   env:DeleteLocalRef(cls)
@@ -284,10 +303,13 @@ function Obj:set(name, desc, value)
 end
 
 function Obj:class()
-  local env = self.env
+  local env = self.vm:env()
   local local_cls = env:GetObjectClass(self.ref)
   local ref = env:NewGlobalRef(local_cls)
   env:DeleteLocalRef(local_cls)
+  local ex = pending(env)
+  if ex then error(ex, 3) end
+  if not ref then err("cannot create a global reference for the class") end
   return setmetatable({
     vm = self.vm, env = env, ref = ref,
     _methods = {}, _smethods = {}, _fields = {}, _sfields = {},
@@ -322,7 +344,7 @@ function Class:methodID(name, sig)
   local key = name .. sig
   local id = self._methods[key]
   if id then return id end
-  local env = self.env
+  local env = self.vm:env()
   id = env:GetMethodID(self.ref, name, sig)
   local ex = pending(env)
   if ex then error(ex, 3) end
@@ -335,7 +357,7 @@ function Class:staticID(name, sig)
   local key = name .. sig
   local id = self._smethods[key]
   if id then return id end
-  local env = self.env
+  local env = self.vm:env()
   id = env:GetStaticMethodID(self.ref, name, sig)
   local ex = pending(env)
   if ex then error(ex, 3) end
@@ -348,7 +370,7 @@ function Class:staticFieldID(name, desc)
   local key = name .. desc
   local id = self._sfields[key]
   if id then return id end
-  local env = self.env
+  local env = self.vm:env()
   id = env:GetStaticFieldID(self.ref, name, desc)
   local ex = pending(env)
   if ex then error(ex, 3) end
@@ -370,7 +392,7 @@ function Class:new(sig, ...)
     local boxed = {}
     for i = 1, #params do boxed[i] = boxArg(env, params[i], packed[i]) end
     return env:NewObject(self.ref, mid, boxed)
-  end)
+  end, 16 + 2 * #params)
 end
 
 function Class:callStatic(name, sig, ...)
@@ -378,18 +400,18 @@ function Class:callStatic(name, sig, ...)
   local n = select("#", ...)
   checkArity(name, sig, params, n)
   local mid = self:staticID(name, sig)
-  return callMethod(self.vm, self.env, self.ref, mid, callName(ret, true), params, ret, ...)
+  return callMethod(self.vm, self.env, self, mid, callName(ret, true), params, ret, ...)
 end
 
 function Class:static(name, sig)
   local params, ret = parse(sig)
   local mid = self:staticID(name, sig)
   local fname = callName(ret, true)
-  local env, ref, vm = self.env, self.ref, self.vm
+  local owner, env = self, self.env
   return function(...)
     local n = select("#", ...)
     checkArity(name, sig, params, n)
-    return callMethod(vm, env, ref, mid, fname, params, ret, ...)
+    return callMethod(owner.vm, env, owner, mid, fname, params, ret, ...)
   end
 end
 
@@ -508,7 +530,10 @@ function VM:class(name)
   if not ref then err("class not found: %s", name) end
   local global = env:NewGlobalRef(ref)
   env:DeleteLocalRef(ref)
-  if not global then err("cannot create a global reference for %s", name) end
+  if not global then
+    local ex2 = pending(env)
+    error(ex2 or ("luajni: cannot create a global reference for " .. name), 2)
+  end
   return newClass(self, env, global, name)
 end
 
@@ -519,13 +544,15 @@ function VM:array(desc, values)
   local n, vals
   if type(values) == "number" then
     n = math.tointeger(values) or err("array length must be an integer")
+    if n < 0 then err("array length must not be negative") end
   elseif type(values) == "table" then
     vals = values
   elseif values ~= nil then
     err("array values must be a table or a length")
   end
   local env = self:env()
-  return guarded(self, desc, function() return newArrayRef(env, desc, vals, n) end)
+  local count = n or (vals and #vals) or 0
+  return guarded(self, desc, function() return newArrayRef(env, desc, vals, n) end, 16 + 2 * count)
 end
 
 function VM:attach()
